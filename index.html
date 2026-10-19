@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Solana Portfolio Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* Tailwind slate-900 */
+            color: #f8fafc; /* Tailwind slate-50 */
+        }
+        
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            border-top: 3px solid #10b981; 
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .gradient-text {
+            background: linear-gradient(to right, #14b8a6, #3b82f6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        /* Custom scrollbar for token lists */
+        .token-list::-webkit-scrollbar {
+            width: 6px;
+        }
+        .token-list::-webkit-scrollbar-track {
+            background: transparent; 
+        }
+        .token-list::-webkit-scrollbar-thumb {
+            background: #334155; 
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-8 flex flex-col items-center">
+
+    <div class="max-w-5xl w-full">
+        <!-- Header -->
+        <header class="mb-8 text-center">
+            <h1 class="text-3xl md:text-4xl font-bold tracking-tight mb-2">Solana <span class="gradient-text">Portfolio Tracker</span></h1>
+            <p class="text-slate-400">Loading automatically from <code class="text-emerald-400 bg-slate-800 px-1 py-0.5 rounded">account.json</code></p>
+        </header>
+
+        <!-- Status / Error Messages -->
+        <div id="statusMessage" class="hidden mb-6 text-sm rounded-lg p-4 text-center max-w-2xl mx-auto border"></div>
+
+        <!-- Loading State -->
+        <div id="loadingState" class="flex flex-col items-center justify-center py-12">
+            <div class="spinner w-12 h-12 mb-4 border-t-emerald-500"></div>
+            <p id="loadingText" class="text-slate-400 animate-pulse">Initializing...</p>
+        </div>
+
+        <!-- Main Dashboard (Hidden initially) -->
+        <div id="dashboard" class="hidden flex-col gap-6">
+            
+            <!-- Total Balance Card -->
+            <div class="bg-slate-800 rounded-2xl p-8 shadow-2xl border border-slate-700 flex flex-col items-center justify-center relative overflow-hidden">
+                <!-- Decorative background glow -->
+                <div class="absolute -top-16 -right-16 w-48 h-48 bg-emerald-500/10 rounded-full blur-3xl z-0"></div>
+                <div class="absolute -bottom-16 -left-16 w-48 h-48 bg-blue-500/10 rounded-full blur-3xl z-0"></div>
+                
+                <p class="text-slate-400 font-medium mb-2 z-10 text-lg uppercase tracking-wider">Grand Total Portfolio Value</p>
+                <h2 class="text-5xl md:text-6xl font-bold text-white z-10 flex items-center gap-1 drop-shadow-lg">
+                    <span class="text-emerald-500">$</span><span id="grandTotalUsd">0.00</span>
+                </h2>
+                <p id="walletCountBadge" class="mt-4 z-10 text-sm bg-slate-700/50 text-slate-300 px-3 py-1 rounded-full border border-slate-600">0 Wallets Scanned</p>
+                <p id="priceRefreshSummary" class="mt-2 z-10 text-xs text-slate-500"></p>
+            </div>
+
+            <!-- One price control per token, shared by all wallets -->
+            <div id="tokenPriceControls" class="bg-slate-800 rounded-2xl p-4 shadow-xl border border-slate-700">
+                <div class="flex items-center justify-between gap-3 mb-3">
+                    <div>
+                        <h3 class="text-sm font-semibold text-slate-200">Token prices</h3>
+                        <p class="text-xs text-slate-500">Refresh a token once for every wallet.</p>
+                    </div>
+                </div>
+                <div id="tokenPriceList" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2"></div>
+            </div>
+
+            <!-- Wallets Grid -->
+            <div id="walletsContainer" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Wallet cards injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const WALLET_API = '/api/wallet?address=';
+        const JUPITER_PRICE_API = '/api/price?ids=';
+        const JUPITER_TOKEN_API = '/api/tokens?ids=';
+        const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+        const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+        const SOL_MINT = 'So11111111111111111111111111111111111111112'; // Wrapped SOL mint for pricing
+        const LAMPORTS_PER_SOL = 1000000000;
+        const REQUEST_TIMEOUT_MS = 90000;
+        // Browsers block fetch() for local file pages. This keeps the supplied account usable
+        // when index.html is opened directly, while account.json remains the source over HTTP.
+        const LOCAL_ACCOUNT_FALLBACK = [
+            { name: 'akhilpagalhai1@gmail.com', address: '5uyqJdaExRFyz7DPj37RicfEFA1zvLGCCvQjx7ReJ8Rm' }
+        ];
+
+        let tokenMap = new Map(); // Maps mint address to symbol
+        let tokenMetadata = new Map();
+        const walletAssetsCache = new Map();
+        const PRICE_STORAGE_KEY = 'solana-portfolio-prices-v1';
+        const storedPrices = loadStoredPrices();
+        let currentPrices = {};
+        let currentWalletData = [];
+        
+        // UI Elements
+        const statusMessage = document.getElementById('statusMessage');
+        const loadingState = document.getElementById('loadingState');
+        const loadingText = document.getElementById('loadingText');
+        const dashboard = document.getElementById('dashboard');
+        const grandTotalUsdEl = document.getElementById('grandTotalUsd');
+        const walletsContainer = document.getElementById('walletsContainer');
+        const walletCountBadge = document.getElementById('walletCountBadge');
+        const tokenPriceList = document.getElementById('tokenPriceList');
+
+        const formatUsd = (num) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(num);
+        const formatTokenPrice = (num) => num > 0 && num < 0.01
+            ? `$${num.toPrecision(4)}`
+            : formatUsd(num);
+        const formatToken = (num) => new Intl.NumberFormat('en-US', { maximumFractionDigits: 8 }).format(num);
+        const formatPriceTime = (timestamp) => timestamp
+            ? new Intl.DateTimeFormat('en-US', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(timestamp))
+            : 'Not refreshed yet';
+
+        function loadStoredPrices() {
+            try {
+                const saved = JSON.parse(localStorage.getItem(PRICE_STORAGE_KEY) || '{}');
+                return saved && typeof saved === 'object' ? saved : {};
+            } catch (error) {
+                console.warn('Stored token prices could not be loaded.', error);
+                return {};
+            }
+        }
+
+        function saveStoredPrices() {
+            try {
+                localStorage.setItem(PRICE_STORAGE_KEY, JSON.stringify(storedPrices));
+            } catch (error) {
+                console.warn('Stored token prices could not be saved.', error);
+            }
+        }
+
+        async function refreshTokenPrice(mint) {
+            const button = document.querySelector(`#tokenPriceList [data-refresh-mint="${mint}"]`);
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Refreshing...';
+            }
+            try {
+                const response = await fetchWithTimeout(`${JUPITER_PRICE_API}${encodeURIComponent(mint)}`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const prices = await response.json();
+                const price = Number(prices[mint]);
+                if (!Number.isFinite(price) || price <= 0) throw new Error('No live price returned');
+                storedPrices[mint] = { price, fetchedAt: new Date().toISOString() };
+                saveStoredPrices();
+                currentPrices[mint] = price;
+                updatePriceDisplay(mint);
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = 'Refresh';
+                }
+            } catch (error) {
+                console.error(`Could not refresh ${mint}:`, error);
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = 'Refresh';
+                }
+                showMessage(`Could not refresh ${getTokenName(mint)}. The stored price is still being used.`, true);
+            }
+        }
+
+        function renderTokenPriceControls(mints, prices) {
+            tokenPriceList.innerHTML = Array.from(mints).map(mint => {
+                const price = Number(prices[mint] ?? storedPrices[mint]?.price ?? 0);
+                const stored = storedPrices[mint];
+                const label = getTokenName(mint);
+                const symbol = getSymbol(mint);
+                return `
+                    <div class="rounded-lg bg-slate-900/60 border border-slate-700 px-3 py-2 flex items-center justify-between gap-2">
+                        <div class="min-w-0">
+                            <div class="text-sm text-slate-200 truncate" title="${mint}">${label}</div>
+                            <div class="text-[10px] text-slate-500">${symbol} · <span data-price-time-mint="${mint}">${stored?.fetchedAt ? formatPriceTime(stored.fetchedAt) : 'Not refreshed yet'}</span></div>
+                        </div>
+                        <div class="text-right shrink-0">
+                            <div class="text-xs text-emerald-400" data-price-mint="${mint}">${price > 0 ? formatTokenPrice(price) : 'Unavailable'}</div>
+                            <button type="button" class="text-[10px] text-emerald-400 hover:text-emerald-300 disabled:opacity-50" data-refresh-mint="${mint}" onclick="refreshTokenPrice('${mint}')">Refresh</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updatePriceDisplay(mint) {
+            const price = Number(currentPrices[mint] ?? storedPrices[mint]?.price ?? 0);
+            const stored = storedPrices[mint];
+            const priceElement = document.querySelector(`#tokenPriceList [data-price-mint="${mint}"]`);
+            const timeElement = document.querySelector(`#tokenPriceList [data-price-time-mint="${mint}"]`);
+            if (priceElement) priceElement.textContent = price > 0 ? formatTokenPrice(price) : 'Unavailable';
+            if (timeElement) timeElement.textContent = stored?.fetchedAt ? formatPriceTime(stored.fetchedAt) : 'Not refreshed yet';
+
+            let grandTotalUsd = 0;
+            currentWalletData.forEach(wallet => {
+                const solValue = wallet.solBalance * Number(currentPrices[SOL_MINT] || storedPrices[SOL_MINT]?.price || 0);
+                const tokenValues = new Map();
+                wallet.tokens.forEach(token => {
+                    const tokenPrice = Number(currentPrices[token.mint] || storedPrices[token.mint]?.price || 0);
+                    tokenValues.set(token.mint, token.amount * tokenPrice);
+                });
+                const walletTotal = solValue + Array.from(tokenValues.values()).reduce((sum, value) => sum + value, 0);
+                grandTotalUsd += walletTotal;
+                const walletTotalElement = document.querySelector(`[data-wallet-total="${wallet.address}"]`);
+                if (walletTotalElement) walletTotalElement.textContent = formatUsd(walletTotal);
+                const solValueElement = document.querySelector(`[data-value-wallet="${wallet.address}"][data-value-mint="${SOL_MINT}"]`);
+                if (solValueElement) solValueElement.textContent = solValue > 0 ? formatUsd(solValue) : 'Price unavailable';
+                wallet.tokens.forEach(token => {
+                    const value = tokenValues.get(token.mint) || 0;
+                    const valueElement = document.querySelector(`[data-value-wallet="${wallet.address}"][data-value-mint="${token.mint}"]`);
+                    if (valueElement) valueElement.textContent = value > 0 ? formatUsd(value) : 'Price unavailable';
+                });
+            });
+            grandTotalUsdEl.textContent = grandTotalUsd.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            });
+        }
+
+        async function fetchWithTimeout(url, options = {}) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+            try {
+                return await fetch(url, { ...options, signal: controller.signal });
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
+
+        function showMessage(msg, isError = true) {
+            statusMessage.innerHTML = msg;
+            statusMessage.classList.remove('hidden');
+            if (isError) {
+                statusMessage.classList.add('bg-red-900/30', 'text-red-400', 'border-red-800');
+                statusMessage.classList.remove('bg-emerald-900/30', 'text-emerald-400', 'border-emerald-800');
+                loadingState.classList.add('hidden');
+            } else {
+                statusMessage.classList.add('bg-emerald-900/30', 'text-emerald-400', 'border-emerald-800');
+                statusMessage.classList.remove('bg-red-900/30', 'text-red-400', 'border-red-800');
+            }
+        }
+
+        // 1. Fetch Verified Token List
+        async function fetchTokenList() {
+            loadingText.textContent = "Preparing token metadata...";
+            tokenMap.set(SOL_MINT, 'SOL');
+        }
+
+        function getSymbol(mint) {
+            if (tokenMap.has(mint)) return tokenMap.get(mint);
+            return `${mint.substring(0,4)}..${mint.substring(mint.length-4)}`;
+        }
+
+        function getTokenName(mint) {
+            return tokenMetadata.get(mint)?.name || getSymbol(mint);
+        }
+
+        async function fetchTokenMetadata(mints) {
+            const mintArray = Array.from(mints);
+            if (mintArray.length === 0) return;
+            loadingText.textContent = "Resolving token names...";
+            try {
+                const res = await fetchWithTimeout(`${JUPITER_TOKEN_API}${mintArray.join(',')}`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const metadata = await res.json();
+                for (const [mint, info] of Object.entries(metadata)) {
+                    tokenMetadata.set(mint, info);
+                    if (info.symbol) tokenMap.set(mint, info.symbol);
+                }
+            } catch (error) {
+                console.warn("Token names unavailable; showing mint fallbacks.", error);
+            }
+        }
+
+        // 2. Fetch SOL Balance & SPL Tokens for an address
+        async function fetchWalletAssets(address) {
+            if (walletAssetsCache.has(address)) {
+                return walletAssetsCache.get(address);
+            }
+            const assetsPromise = fetchWalletAssetsFromRpc(address).then(assets => {
+                if (assets.unavailable || assets.partial) walletAssetsCache.delete(address);
+                return assets;
+            });
+            walletAssetsCache.set(address, assetsPromise);
+            return assetsPromise;
+        }
+
+        async function fetchWalletAssetsFromRpc(address) {
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                const response = await fetchWithTimeout(`${WALLET_API}${encodeURIComponent(address)}`);
+                if (!response.ok) throw new Error(`RPC HTTP ${response.status}`);
+                const assets = await response.json();
+                if (assets.unavailable || assets.partial) {
+                    throw new Error('Wallet response was incomplete');
+                }
+                return assets;
+                } catch (e) {
+                    if (attempt === 2) {
+                        console.error(`Error fetching data for ${address}:`, e);
+                        return { solBalance: 0, tokens: [], unavailable: true };
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                }
+            }
+        }
+
+        // 3. Fetch Prices for all found mints
+        async function fetchPrices(mints) {
+            if (mints.size === 0) return {};
+            loadingText.textContent = "Fetching live token prices...";
+            
+            // Chunk mints to avoid URL too long (Jupiter can handle a lot, but safe to limit)
+            const mintArray = Array.from(mints);
+            let prices = {};
+            for (const mint of mintArray) {
+                if (storedPrices[mint] && Number.isFinite(Number(storedPrices[mint].price))) {
+                    prices[mint] = Number(storedPrices[mint].price);
+                }
+            }
+            
+            const chunkSize = 100;
+            for (let i = 0; i < mintArray.length; i += chunkSize) {
+                const chunk = mintArray.slice(i, i + chunkSize);
+                for (let attempt = 0; attempt < 4; attempt++) {
+                    try {
+                        const res = await fetchWithTimeout(`${JUPITER_PRICE_API}${chunk.join(',')}`);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        for (const [id, info] of Object.entries(data)) {
+                            const usdPrice = typeof info === 'number' ? info : info.usdPrice;
+                            if (typeof usdPrice === 'number') {
+                                prices[id] = usdPrice;
+                                storedPrices[id] = { price: usdPrice, fetchedAt: new Date().toISOString() };
+                            }
+                        }
+                        saveStoredPrices();
+                        if (Object.keys(data).length > 0 || attempt === 3) break;
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    } catch (e) {
+                        if (attempt === 3) console.error("Error fetching prices chunk:", e);
+                    }
+                }
+            }
+            return prices;
+        }
+
+        // Main Execution
+        async function init() {
+            loadingText.textContent = "Loading account.json...";
+            let accounts = [];
+            
+            try {
+                const res = await fetchWithTimeout('account.json');
+                if (!res.ok) throw new Error("Failed to load file");
+                accounts = await res.json();
+                if (!Array.isArray(accounts)) throw new Error("account.json must be an array");
+            } catch (e) {
+                if (window.location.protocol === 'file:') {
+                    accounts = LOCAL_ACCOUNT_FALLBACK;
+                    showMessage("Opened directly from a file. Using the bundled account; use a local server to load account.json automatically.", false);
+                } else {
+                    showMessage(`
+                        <strong>Error loading account.json</strong><br>
+                        Make sure the file exists in the same directory and contains a JSON array.
+                    `);
+                    return;
+                }
+            }
+
+            if (accounts.length === 0) {
+                showMessage("account.json is empty.");
+                return;
+            }
+
+            await fetchTokenList();
+
+            loadingText.textContent = "Querying Solana blockchain for balances...";
+            
+            let allMintsToPrice = new Set([SOL_MINT]);
+            let walletData = [];
+
+            // Fetch balances for all wallets concurrently; duplicate addresses use the cache.
+            const loadedWallets = [];
+            const walletQueue = [...accounts];
+            const loadWallet = async () => {
+                while (walletQueue.length > 0) {
+                    const acc = walletQueue.shift();
+                    const assets = await fetchWalletAssets(acc.address);
+                    loadedWallets.push({
+                        name: acc.name || 'Unnamed',
+                        address: acc.address,
+                        solBalance: assets.solBalance,
+                        tokens: assets.tokens,
+                        unavailable: assets.unavailable
+                    });
+                }
+            };
+            await Promise.all([loadWallet(), loadWallet(), loadWallet()]);
+            loadedWallets.forEach(wallet => {
+                wallet.tokens.forEach(t => allMintsToPrice.add(t.mint));
+            });
+            walletData = loadedWallets;
+
+            // Fetch prices
+            await fetchTokenMetadata(allMintsToPrice);
+            const prices = await fetchPrices(allMintsToPrice);
+            currentPrices = prices;
+            currentWalletData = walletData;
+            renderTokenPriceControls(allMintsToPrice, prices);
+
+            // Calculate totals and render
+            loadingText.textContent = "Rendering dashboard...";
+            let grandTotalUsd = 0;
+            let cardsHtml = '';
+
+            walletData.forEach(wallet => {
+                let walletTotalUsd = 0;
+                
+                // Calculate SOL Value
+                const solPrice = prices[SOL_MINT] || 0;
+                const solUsdValue = wallet.solBalance * solPrice;
+                walletTotalUsd += solUsdValue;
+
+                // Prepare Token List HTML
+                let tokensHtml = '';
+                
+                // Add SOL to token list if > 0
+                if (wallet.solBalance > 0) {
+                    tokensHtml += `
+                        <div class="flex justify-between items-center py-2 border-b border-slate-700/50">
+                            <div class="flex items-center gap-2">
+                                <div class="w-6 h-6 rounded-full bg-emerald-500/20 flex items-center justify-center text-xs font-bold text-emerald-400">S</div>
+                                <span class="font-medium text-slate-200">SOL</span>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-slate-200">${formatToken(wallet.solBalance)}</div>
+                                <div class="text-xs text-emerald-400" data-value-wallet="${wallet.address}" data-value-mint="${SOL_MINT}">${solPrice > 0 ? formatUsd(solUsdValue) : 'Price unavailable'}</div>
+                                <div class="text-[10px] text-slate-500">${formatPriceTime(storedPrices[SOL_MINT]?.fetchedAt)}</div>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                // Add SPL Tokens
+                // Sort tokens by USD value (descending)
+                const enrichedTokens = wallet.tokens.map(t => {
+                    const price = prices[t.mint] || 0;
+                    const usdVal = t.amount * price;
+                    return { ...t, usdVal };
+                }).sort((a, b) => b.usdVal - a.usdVal);
+
+                enrichedTokens.forEach(t => {
+                    walletTotalUsd += t.usdVal;
+                    const symbol = getSymbol(t.mint);
+                    const tokenName = getTokenName(t.mint);
+                    const isKnown = tokenMap.has(t.mint);
+                    
+                    tokensHtml += `
+                        <div class="flex justify-between items-center py-2 border-b border-slate-700/50 last:border-0">
+                            <div class="flex items-center gap-2">
+                                <div class="w-6 h-6 rounded-full bg-slate-700 flex items-center justify-center text-[10px] font-bold text-slate-300">
+                                    ${symbol.substring(0,1).toUpperCase()}
+                                </div>
+                                <div class="flex flex-col">
+                                    <span class="font-medium text-slate-200 text-sm" title="${t.mint}">${tokenName}</span>
+                                    <span class="text-[10px] text-slate-400">${symbol}</span>
+                                    ${!isKnown ? `<span class="text-[10px] text-slate-500">Unknown Token</span>` : ''}
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-slate-200 text-sm">${formatToken(t.amount)}</div>
+                                <div class="text-xs text-slate-400" data-value-wallet="${wallet.address}" data-value-mint="${t.mint}">${t.usdVal > 0 ? formatUsd(t.usdVal) : (prices[t.mint] ? '< $0.01' : 'Price unavailable')}</div>
+                                <div class="text-[10px] text-slate-500">${formatPriceTime(storedPrices[t.mint]?.fetchedAt)}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                if (wallet.solBalance === 0 && wallet.tokens.length === 0) {
+                    tokensHtml = `<div class="text-center text-slate-500 py-4 text-sm">${wallet.unavailable ? 'Blockchain data is temporarily unavailable' : 'No assets found'}</div>`;
+                }
+
+                grandTotalUsd += walletTotalUsd;
+                const shortAddr = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+
+                cardsHtml += `
+                    <div class="bg-slate-800 rounded-xl border border-slate-700 flex flex-col overflow-hidden hover:border-slate-600 transition-colors">
+                        <!-- Card Header -->
+                        <div class="bg-slate-900/50 p-4 border-b border-slate-700 flex justify-between items-start">
+                            <div>
+                                <h3 class="text-lg font-bold text-white mb-1">${wallet.name}</h3>
+                                <code class="text-xs text-slate-400 bg-slate-950 px-2 py-1 rounded border border-slate-800" title="${wallet.address}">${shortAddr}</code>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-sm text-slate-400">Total Value</div>
+                                <div class="text-xl font-bold text-emerald-400" data-wallet-total="${wallet.address}">${formatUsd(walletTotalUsd)}</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Assets List -->
+                        <div class="p-4 flex-grow bg-slate-800/80">
+                            <h4 class="text-xs uppercase tracking-wider text-slate-500 mb-3 font-semibold">Assets</h4>
+                            <div class="token-list max-h-64 overflow-y-auto pr-2">
+                                ${tokensHtml}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            // Update UI
+            loadingState.classList.add('hidden');
+            dashboard.classList.remove('hidden');
+            dashboard.classList.add('flex');
+            
+            grandTotalUsdEl.textContent = grandTotalUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            walletCountBadge.textContent = `${walletData.length} Wallet${walletData.length !== 1 ? 's' : ''} Scanned`;
+            const refreshedAt = Object.values(storedPrices)
+                .map(entry => entry.fetchedAt)
+                .filter(Boolean)
+                .sort()
+                .pop();
+            document.getElementById('priceRefreshSummary').textContent = refreshedAt
+                ? `Token prices last refreshed: ${formatPriceTime(refreshedAt)}`
+                : 'Token prices have not been refreshed yet';
+            walletsContainer.innerHTML = cardsHtml;
+        }
+
+        // Start app
+        window.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>
