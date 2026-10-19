@@ -287,5 +287,5 @@ class TrackerHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 10000))
-    print(f"Solana Portfolio Tracker running on 0.0.0.0:{port}")
-    ThreadingHTTPServer(("0.0.0.0", port), TrackerHandler).serve_forever()
+    print(f"Solana Portfolio Tracker running on port {port}", flush=True)
+    ThreadingHTTPServer(("", port), TrackerHandler).serve_forever()
