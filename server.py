@@ -281,6 +281,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
         return wallet
 
 
+# if __name__ == "__main__":
+#     print("Solana Portfolio Tracker: http://127.0.0.1:8000/index.html")
+#     ThreadingHTTPServer(("127.0.0.1", 8000), TrackerHandler).serve_forever()
 if __name__ == "__main__":
-    print("Solana Portfolio Tracker: http://127.0.0.1:8000/index.html")
-    ThreadingHTTPServer(("127.0.0.1", 8000), TrackerHandler).serve_forever()
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Solana Portfolio Tracker running on 0.0.0.0:{port}")
+    ThreadingHTTPServer(("0.0.0.0", port), TrackerHandler).serve_forever()
