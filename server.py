@@ -7,6 +7,7 @@ import json
 import re
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parent
 SOLANA_RPC_URLS = (
@@ -24,14 +25,26 @@ RPC_CACHE_TTL_SECONDS = 30
 WALLET_CACHE_TTL_SECONDS = 60
 PRICE_CACHE_TTL_SECONDS = 900
 PRICE_CACHE_FILE = ROOT / "price_cache.json"
+WALLET_CACHE_FILE = ROOT / "wallet_cache.json"
 RPC_TIMEOUT_SECONDS = 12
 WALLET_ADDRESS_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-RPC_REQUEST_LOCK = threading.Lock()
 WALLET_CACHE = {}
+WALLET_SNAPSHOT_CACHE = {}
+WALLET_REFRESHES = {}
+WALLET_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 try:
     PRICE_CACHE = json.loads(PRICE_CACHE_FILE.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
     PRICE_CACHE = {}
+try:
+    saved_wallets = json.loads(WALLET_CACHE_FILE.read_text(encoding="utf-8"))
+    if isinstance(saved_wallets, dict):
+        WALLET_SNAPSHOT_CACHE = {
+            address: wallet for address, wallet in saved_wallets.items()
+            if isinstance(wallet, dict)
+        }
+except (OSError, json.JSONDecodeError):
+    pass
 
 
 class TrackerHandler(BaseHTTPRequestHandler):
@@ -222,12 +235,28 @@ class TrackerHandler(BaseHTTPRequestHandler):
         return None
 
     def _get_wallet(self, address):
-        with RPC_REQUEST_LOCK:
+        with RPC_CACHE_LOCK:
+            cached = WALLET_CACHE.get(address)
+            snapshot = WALLET_SNAPSHOT_CACHE.get(address)
+        if cached and time.monotonic() - cached[0] < WALLET_CACHE_TTL_SECONDS:
+            self._schedule_wallet_refresh(address)
+            return cached[1]
+        if snapshot:
+            self._schedule_wallet_refresh(address)
             with RPC_CACHE_LOCK:
-                cached = WALLET_CACHE.get(address)
-            if cached and time.monotonic() - cached[0] < WALLET_CACHE_TTL_SECONDS:
-                return cached[1]
+                WALLET_CACHE[address] = (time.monotonic(), snapshot)
+            return snapshot
+        return self._refresh_wallet(address)
 
+    def _schedule_wallet_refresh(self, address):
+        with RPC_CACHE_LOCK:
+            refresh = WALLET_REFRESHES.get(address)
+            if refresh is None or refresh.done():
+                WALLET_REFRESHES[address] = WALLET_REFRESH_EXECUTOR.submit(
+                    self._refresh_wallet, address
+                )
+
+    def _refresh_wallet(self, address):
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address]},
             {"jsonrpc": "2.0", "id": 2, "method": "getTokenAccountsByOwner", "params": [
@@ -240,10 +269,14 @@ class TrackerHandler(BaseHTTPRequestHandler):
             ]},
         ]
         responses = {}
-        for request_body in requests:
+        def fetch_request(request_body):
             result = self._forward_rpc(json.dumps(request_body).encode())
-            if result is not None:
-                responses[request_body["id"]] = json.loads(result)
+            return request_body["id"], result
+
+        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+            for request_id, result in executor.map(fetch_request, requests):
+                if result is not None:
+                    responses[request_id] = json.loads(result)
 
         sol_balance = 0
         balance_response = responses.get(1)
@@ -275,15 +308,29 @@ class TrackerHandler(BaseHTTPRequestHandler):
             "unavailable": not responses,
             "partial": len(responses) < 3,
         }
-        if not wallet["unavailable"] and not wallet["partial"]:
-            with RPC_CACHE_LOCK:
-                WALLET_CACHE[address] = (time.monotonic(), wallet)
+        with RPC_CACHE_LOCK:
+            previous = WALLET_SNAPSHOT_CACHE.get(address)
+            if not wallet["unavailable"] and (
+                previous is None
+                or not wallet["partial"]
+            ):
+                wallet["refreshedAt"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                )
+                WALLET_SNAPSHOT_CACHE[address] = wallet
+                try:
+                    WALLET_CACHE_FILE.write_text(
+                        json.dumps(WALLET_SNAPSHOT_CACHE, indent=2),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            elif previous:
+                wallet = previous
+            WALLET_CACHE[address] = (time.monotonic(), wallet)
         return wallet
 
 
-# if __name__ == "__main__":
-#     print("Solana Portfolio Tracker: http://127.0.0.1:8000/index.html")
-#     ThreadingHTTPServer(("127.0.0.1", 8000), TrackerHandler).serve_forever()
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 10000))

@@ -305,7 +305,7 @@
                 return walletAssetsCache.get(address);
             }
             const assetsPromise = fetchWalletAssetsFromRpc(address).then(assets => {
-                if (assets.unavailable || assets.partial) walletAssetsCache.delete(address);
+                if (assets.unavailable) walletAssetsCache.delete(address);
                 return assets;
             });
             walletAssetsCache.set(address, assetsPromise);
@@ -318,8 +318,8 @@
                 const response = await fetchWithTimeout(`${WALLET_API}${encodeURIComponent(address)}`);
                 if (!response.ok) throw new Error(`RPC HTTP ${response.status}`);
                 const assets = await response.json();
-                if (assets.unavailable || assets.partial) {
-                    throw new Error('Wallet response was incomplete');
+                if (assets.unavailable) {
+                    throw new Error('Wallet response was unavailable');
                 }
                 return assets;
                 } catch (e) {
@@ -329,6 +329,32 @@
                     }
                     await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
                 }
+            }
+
+        }
+
+        async function sortAccountsBySavedRefresh(accounts) {
+            try {
+                const response = await fetchWithTimeout('wallet_cache.json');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const savedWallets = await response.json();
+                if (!savedWallets || typeof savedWallets !== 'object') return accounts;
+
+                return accounts
+                    .map((account, index) => ({
+                        account,
+                        index,
+                        refreshedAt: savedWallets[account.address]?.refreshedAt || null
+                    }))
+                    .sort((left, right) => {
+                        const leftTime = left.refreshedAt ? Date.parse(left.refreshedAt) : 0;
+                        const rightTime = right.refreshedAt ? Date.parse(right.refreshedAt) : 0;
+                        return leftTime - rightTime || left.index - right.index;
+                    })
+                    .map(item => item.account);
+            } catch (error) {
+                console.warn('Saved wallet refresh order unavailable; using account.json order.', error);
+                return accounts;
             }
         }
 
@@ -403,24 +429,29 @@
             await fetchTokenList();
 
             loadingText.textContent = "Querying Solana blockchain for balances...";
+            accounts = await sortAccountsBySavedRefresh(accounts);
             
             let allMintsToPrice = new Set([SOL_MINT]);
             let walletData = [];
 
             // Fetch balances for all wallets concurrently; duplicate addresses use the cache.
-            const loadedWallets = [];
+            const loadedWallets = new Array(accounts.length);
             const walletQueue = [...accounts];
             const loadWallet = async () => {
                 while (walletQueue.length > 0) {
-                    const acc = walletQueue.shift();
+                    const queueItem = walletQueue.shift();
+                    const accountIndex = accounts.indexOf(queueItem);
+                    const acc = queueItem;
                     const assets = await fetchWalletAssets(acc.address);
-                    loadedWallets.push({
+                    loadedWallets[accountIndex] = {
                         name: acc.name || 'Unnamed',
                         address: acc.address,
                         solBalance: assets.solBalance,
                         tokens: assets.tokens,
-                        unavailable: assets.unavailable
-                    });
+                        unavailable: assets.unavailable,
+                        partial: assets.partial,
+                        refreshedAt: assets.refreshedAt
+                    };
                 }
             };
             await Promise.all([loadWallet(), loadWallet(), loadWallet()]);
@@ -522,6 +553,7 @@
                             <div class="text-right">
                                 <div class="text-sm text-slate-400">Total Value</div>
                                 <div class="text-xl font-bold text-emerald-400" data-wallet-total="${wallet.address}">${formatUsd(walletTotalUsd)}</div>
+                                ${wallet.refreshedAt ? `<div class="text-[10px] text-slate-500 mt-1">Saved ${formatPriceTime(wallet.refreshedAt)}</div>` : ''}
                             </div>
                         </div>
                         
