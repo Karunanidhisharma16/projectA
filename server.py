@@ -11,15 +11,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parent
 SOLANA_RPC_URLS = (
-    "https://solana-rpc.publicnode.com",
-    "https://api.mainnet.solana.com",
     "https://api.mainnet-beta.solana.com",
+    "https://api.mainnet.solana.com",
 )
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 JUPITER_TOKEN_SEARCH_URL = "https://api.jup.ag/tokens/v2/search?query="
+DEFAULT_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
 RPC_CACHE = {}
 RPC_CACHE_LOCK = threading.Lock()
+RPC_RATE_LIMIT_LOCK = threading.Lock()
+LAST_RPC_CALL_TIME = 0.0
+MIN_RPC_INTERVAL = 0.12  # Minimum 120ms between outbound RPC requests
 RPC_PROVIDER_INDEX = 0
 RPC_CACHE_TTL_SECONDS = 30
 WALLET_CACHE_TTL_SECONDS = 60
@@ -31,7 +38,7 @@ WALLET_ADDRESS_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 WALLET_CACHE = {}
 WALLET_SNAPSHOT_CACHE = {}
 WALLET_REFRESHES = {}
-WALLET_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+WALLET_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 try:
     PRICE_CACHE = json.loads(PRICE_CACHE_FILE.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
@@ -59,18 +66,20 @@ class TrackerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path)
         if path.path == "/api/wallet":
-            address = parse_qs(path.query).get("address", [""])[0]
+            qs = parse_qs(path.query)
+            address = qs.get("address", [""])[0]
+            force = qs.get("refresh", ["0"])[0] in ("1", "true", "True") or qs.get("force", ["0"])[0] in ("1", "true", "True")
             if not WALLET_ADDRESS_PATTERN.fullmatch(address):
                 self._send(400, "application/json", b'{"error":"Invalid wallet address"}')
                 return
-            self._send(200, "application/json", json.dumps(self._get_wallet(address)).encode())
+            self._send(200, "application/json", json.dumps(self._get_wallet(address, force=force)).encode())
             return
         if path.path == "/api/price":
             ids = [value for value in parse_qs(path.query).get("ids", [""])[0].split(",") if value]
             prices = {}
             for attempt in range(3):
                 try:
-                    request = Request(f"{JUPITER_PRICE_URL}?ids={','.join(ids)}")
+                    request = Request(f"{JUPITER_PRICE_URL}?ids={','.join(ids)}", headers=DEFAULT_HEADERS)
                     with urlopen(request, timeout=10) as response:
                         payload = json.loads(response.read())
                     for mint, info in payload.items():
@@ -86,7 +95,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 if mint in prices:
                     continue
                 try:
-                    request = Request(f"{JUPITER_PRICE_URL}?ids={mint}")
+                    request = Request(f"{JUPITER_PRICE_URL}?ids={mint}", headers=DEFAULT_HEADERS)
                     with urlopen(request, timeout=10) as response:
                         payload = json.loads(response.read())
                     info = payload.get(mint)
@@ -99,7 +108,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 if mint in prices:
                     continue
                 try:
-                    request = Request(DEXSCREENER_TOKEN_URL + mint)
+                    request = Request(DEXSCREENER_TOKEN_URL + mint, headers=DEFAULT_HEADERS)
                     with urlopen(request, timeout=8) as response:
                         payload = json.loads(response.read())
                     pairs = [
@@ -138,7 +147,7 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     }
                     continue
                 try:
-                    request = Request(JUPITER_TOKEN_SEARCH_URL + mint)
+                    request = Request(JUPITER_TOKEN_SEARCH_URL + mint, headers=DEFAULT_HEADERS)
                     with urlopen(request, timeout=10) as response:
                         matches = json.loads(response.read())
                     match = next((item for item in matches if item.get("id") == mint), None)
@@ -200,6 +209,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._send(500, "application/json", json.dumps({"error": str(error)}).encode())
 
+    def _rate_limit_wait(self):
+        global LAST_RPC_CALL_TIME
+        with RPC_RATE_LIMIT_LOCK:
+            now = time.monotonic()
+            elapsed = now - LAST_RPC_CALL_TIME
+            if elapsed < MIN_RPC_INTERVAL:
+                time.sleep(MIN_RPC_INTERVAL - elapsed)
+            LAST_RPC_CALL_TIME = time.monotonic()
+
     def _forward_rpc(self, body):
         cache_key = body.decode("utf-8")
         with RPC_CACHE_LOCK:
@@ -212,12 +230,13 @@ class TrackerHandler(BaseHTTPRequestHandler):
             start_index = RPC_PROVIDER_INDEX
             RPC_PROVIDER_INDEX = (RPC_PROVIDER_INDEX + 1) % len(SOLANA_RPC_URLS)
         ordered_urls = SOLANA_RPC_URLS[start_index:] + SOLANA_RPC_URLS[:start_index]
-        for retry_round in range(2):
+        for retry_round in range(3):
             for rpc_url in ordered_urls:
+                self._rate_limit_wait()
                 request = Request(
                     rpc_url,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=DEFAULT_HEADERS,
                     method="POST",
                 )
                 try:
@@ -229,17 +248,23 @@ class TrackerHandler(BaseHTTPRequestHandler):
                         with RPC_CACHE_LOCK:
                             RPC_CACHE[cache_key] = (time.monotonic(), result)
                         return result
-                except (HTTPError, OSError, TimeoutError, json.JSONDecodeError):
+                except HTTPError as error:
+                    if error.code == 429:
+                        time.sleep(1.0 * (retry_round + 1))
                     continue
-            time.sleep(retry_round + 1)
+                except (OSError, TimeoutError, json.JSONDecodeError):
+                    continue
+            time.sleep(0.5 * (retry_round + 1))
         return None
 
-    def _get_wallet(self, address):
+    def _get_wallet(self, address, force=False):
+        if force:
+            return self._refresh_wallet(address)
+
         with RPC_CACHE_LOCK:
             cached = WALLET_CACHE.get(address)
             snapshot = WALLET_SNAPSHOT_CACHE.get(address)
         if cached and time.monotonic() - cached[0] < WALLET_CACHE_TTL_SECONDS:
-            self._schedule_wallet_refresh(address)
             return cached[1]
         if snapshot:
             self._schedule_wallet_refresh(address)
@@ -269,16 +294,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
             ]},
         ]
         responses = {}
-        def fetch_request(request_body):
+        for request_body in requests:
             result = self._forward_rpc(json.dumps(request_body).encode())
-            return request_body["id"], result
+            if result is not None:
+                try:
+                    responses[request_body["id"]] = json.loads(result)
+                except json.JSONDecodeError:
+                    pass
 
-        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
-            for request_id, result in executor.map(fetch_request, requests):
-                if result is not None:
-                    responses[request_id] = json.loads(result)
-
-        sol_balance = 0
+        sol_balance = 0.0
         balance_response = responses.get(1)
         if balance_response and isinstance(balance_response.get("result"), dict):
             sol_balance = balance_response["result"].get("value", 0) / 1_000_000_000
@@ -310,21 +334,23 @@ class TrackerHandler(BaseHTTPRequestHandler):
         }
         with RPC_CACHE_LOCK:
             previous = WALLET_SNAPSHOT_CACHE.get(address)
-            if not wallet["unavailable"] and (
-                previous is None
-                or not wallet["partial"]
-            ):
-                wallet["refreshedAt"] = time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                )
-                WALLET_SNAPSHOT_CACHE[address] = wallet
-                try:
-                    WALLET_CACHE_FILE.write_text(
-                        json.dumps(WALLET_SNAPSHOT_CACHE, indent=2),
-                        encoding="utf-8",
+            if not wallet["unavailable"]:
+                if not wallet["partial"] or previous is None:
+                    wallet["refreshedAt"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
                     )
-                except OSError:
-                    pass
+                    WALLET_SNAPSHOT_CACHE[address] = wallet
+                    try:
+                        WALLET_CACHE_FILE.write_text(
+                            json.dumps(WALLET_SNAPSHOT_CACHE, indent=2),
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
+                elif previous and wallet["partial"]:
+                    if 1 in responses:
+                        previous["solBalance"] = sol_balance
+                    wallet = previous
             elif previous:
                 wallet = previous
             WALLET_CACHE[address] = (time.monotonic(), wallet)
