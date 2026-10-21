@@ -131,7 +131,9 @@
         let tokenMetadata = new Map();
         const walletAssetsCache = new Map();
         const PRICE_STORAGE_KEY = 'solana-portfolio-prices-v1';
+        const WALLET_STORAGE_KEY = 'solana-portfolio-wallets-v1';
         const storedPrices = loadStoredPrices();
+        const storedWallets = loadStoredWallets();
         let currentPrices = {};
         let currentWalletData = [];
         
@@ -169,6 +171,38 @@
                 localStorage.setItem(PRICE_STORAGE_KEY, JSON.stringify(storedPrices));
             } catch (error) {
                 console.warn('Stored token prices could not be saved.', error);
+            }
+        }
+
+        function loadStoredWallets() {
+            try {
+                const saved = JSON.parse(localStorage.getItem(WALLET_STORAGE_KEY) || '{}');
+                return saved && typeof saved === 'object' ? saved : {};
+            } catch (error) {
+                console.warn('Stored wallets could not be loaded.', error);
+                return {};
+            }
+        }
+
+        function saveStoredWallets() {
+            try {
+                const map = loadStoredWallets();
+                currentWalletData.forEach(w => {
+                    if (w && w.address) {
+                        map[w.address] = {
+                            name: w.name,
+                            address: w.address,
+                            solBalance: w.solBalance,
+                            tokens: w.tokens,
+                            refreshedAt: w.refreshedAt,
+                            unavailable: w.unavailable,
+                            partial: w.partial
+                        };
+                    }
+                });
+                localStorage.setItem(WALLET_STORAGE_KEY, JSON.stringify(map));
+            } catch (error) {
+                console.warn('Stored wallets could not be saved.', error);
             }
         }
 
@@ -441,48 +475,68 @@
 
             await fetchTokenList();
 
-            loadingText.textContent = "Querying Solana blockchain for balances...";
-            accounts = await sortAccountsBySavedRefresh(accounts);
-            
-            let allMintsToPrice = new Set([SOL_MINT]);
-            let walletData = [];
-
-            // Fetch balances for all wallets concurrently; duplicate addresses use the cache.
-            const loadedWallets = new Array(accounts.length);
-            const walletQueue = [...accounts];
-            const loadWallet = async () => {
-                while (walletQueue.length > 0) {
-                    const queueItem = walletQueue.shift();
-                    const accountIndex = accounts.indexOf(queueItem);
-                    const acc = queueItem;
-                    const assets = await fetchWalletAssets(acc.address);
-                    loadedWallets[accountIndex] = {
-                        name: acc.name || 'Unnamed',
-                        address: acc.address,
-                        solBalance: assets.solBalance,
-                        tokens: assets.tokens,
-                        unavailable: assets.unavailable,
-                        partial: assets.partial,
-                        refreshedAt: assets.refreshedAt
-                    };
+            // 1. Fetch latest server wallet_cache.json
+            let serverSavedWallets = {};
+            try {
+                const cacheRes = await fetchWithTimeout('wallet_cache.json');
+                if (cacheRes.ok) {
+                    serverSavedWallets = await cacheRes.json() || {};
                 }
-            };
-            await Promise.all([loadWallet(), loadWallet()]);
-            loadedWallets.forEach(wallet => {
-                (wallet.tokens || []).forEach(t => allMintsToPrice.add(t.mint));
-            });
-            walletData = loadedWallets;
+            } catch (e) {
+                console.warn('Could not load wallet_cache.json', e);
+            }
 
-            // Fetch prices
+            // 2. Build initial wallet data from best of localStorage and server cache
+            let allMintsToPrice = new Set([SOL_MINT]);
+            currentWalletData = accounts.map(acc => {
+                const local = storedWallets[acc.address];
+                const server = serverSavedWallets[acc.address];
+                let best = null;
+                
+                // Anti-fluctuation priority:
+                // If one has tokens and the other doesn't, choose the one with tokens!
+                const localHasTokens = local && Array.isArray(local.tokens) && local.tokens.length > 0;
+                const serverHasTokens = server && Array.isArray(server.tokens) && server.tokens.length > 0;
+                if (localHasTokens && !serverHasTokens) {
+                    best = local;
+                } else if (serverHasTokens && !localHasTokens) {
+                    best = server;
+                } else if (local && server) {
+                    const localTime = local.refreshedAt ? Date.parse(local.refreshedAt) : 0;
+                    const serverTime = server.refreshedAt ? Date.parse(server.refreshedAt) : 0;
+                    best = localTime >= serverTime ? local : server;
+                } else {
+                    best = local || server;
+                }
+
+                const solBalance = Number(best?.solBalance) || 0;
+                const tokens = Array.isArray(best?.tokens) ? best.tokens : [];
+                tokens.forEach(t => allMintsToPrice.add(t.mint));
+
+                return {
+                    name: acc.name || best?.name || 'Unnamed',
+                    address: acc.address,
+                    solBalance: solBalance,
+                    tokens: tokens,
+                    unavailable: false,
+                    partial: false,
+                    refreshedAt: best?.refreshedAt || null
+                };
+            });
+
+            // Save unified wallet data back to localStorage immediately
+            saveStoredWallets();
+
+            // 3. Immediately render the dashboard with the latest saved balances!
+            loadingText.textContent = "Resolving token prices...";
             await fetchTokenMetadata(allMintsToPrice);
             const prices = await fetchPrices(allMintsToPrice);
             currentPrices = prices;
-            currentWalletData = walletData;
             renderTokenPriceControls(allMintsToPrice, prices);
-
-            // Calculate totals and render
-            loadingText.textContent = "Rendering dashboard...";
             renderDashboard();
+
+            // 4. In the background, trigger live refresh so data stays up-to-date
+            refreshAllWallets(true);
 
             // Auto-refresh timer every 90 seconds
             setInterval(() => {
@@ -637,13 +691,25 @@
                 const assets = await fetchWalletAssets(address, true);
                 const walletIndex = currentWalletData.findIndex(w => w.address === address);
                 if (walletIndex !== -1) {
-                    currentWalletData[walletIndex].solBalance = assets.solBalance;
-                    currentWalletData[walletIndex].tokens = assets.tokens;
-                    currentWalletData[walletIndex].unavailable = assets.unavailable;
-                    currentWalletData[walletIndex].partial = assets.partial;
-                    currentWalletData[walletIndex].refreshedAt = assets.refreshedAt || new Date().toISOString();
+                    const prevTokens = currentWalletData[walletIndex].tokens || [];
+                    // Anti-fluctuation guard:
+                    // If previously this wallet had tokens, and the new live query returned unavailable or an empty token list due to an RPC glitch, DO NOT wipe out the tokens!
+                    const returnedEmptyTokens = !assets.tokens || assets.tokens.length === 0;
+                    if ((assets.unavailable || (assets.partial && returnedEmptyTokens)) && prevTokens.length > 0) {
+                        console.warn(`Preserved previous balance for ${address} due to RPC partial/unavailable status.`);
+                        currentWalletData[walletIndex].unavailable = true;
+                    } else {
+                        currentWalletData[walletIndex].solBalance = Number(assets.solBalance) || 0;
+                        currentWalletData[walletIndex].tokens = Array.isArray(assets.tokens) ? assets.tokens : [];
+                        currentWalletData[walletIndex].unavailable = Boolean(assets.unavailable);
+                        currentWalletData[walletIndex].partial = Boolean(assets.partial);
+                        currentWalletData[walletIndex].refreshedAt = assets.refreshedAt || new Date().toISOString();
+                    }
 
-                    const newMints = (assets.tokens || []).map(t => t.mint).filter(m => !currentPrices[m]);
+                    // Save latest known balance to localStorage immediately!
+                    saveStoredWallets();
+
+                    const newMints = (currentWalletData[walletIndex].tokens || []).map(t => t.mint).filter(m => !currentPrices[m]);
                     if (newMints.length > 0) {
                         await fetchTokenMetadata(newMints);
                         const newPrices = await fetchPrices(new Set(newMints));
@@ -697,6 +763,9 @@
                 }
             };
             await Promise.all([worker(), worker()]);
+
+            // Save all wallets to localStorage
+            saveStoredWallets();
 
             const summary = document.getElementById('walletRefreshSummary');
             if (summary) {

@@ -59,6 +59,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -264,6 +267,15 @@ class TrackerHandler(BaseHTTPRequestHandler):
         with RPC_CACHE_LOCK:
             cached = WALLET_CACHE.get(address)
             snapshot = WALLET_SNAPSHOT_CACHE.get(address)
+            if snapshot is None:
+                try:
+                    saved = json.loads(WALLET_CACHE_FILE.read_text(encoding="utf-8"))
+                    if isinstance(saved, dict) and address in saved:
+                        snapshot = saved[address]
+                        WALLET_SNAPSHOT_CACHE[address] = snapshot
+                except Exception:
+                    pass
+
         if cached and time.monotonic() - cached[0] < WALLET_CACHE_TTL_SECONDS:
             return cached[1]
         if snapshot:
