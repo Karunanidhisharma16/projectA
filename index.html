@@ -265,30 +265,7 @@
             if (priceElement) priceElement.textContent = price > 0 ? formatTokenPrice(price) : 'Unavailable';
             if (timeElement) timeElement.textContent = stored?.fetchedAt ? formatPriceTime(stored.fetchedAt) : 'Not refreshed yet';
 
-            let grandTotalUsd = 0;
-            currentWalletData.forEach(wallet => {
-                const solValue = wallet.solBalance * Number(currentPrices[SOL_MINT] || storedPrices[SOL_MINT]?.price || 0);
-                const tokenValues = new Map();
-                wallet.tokens.forEach(token => {
-                    const tokenPrice = Number(currentPrices[token.mint] || storedPrices[token.mint]?.price || 0);
-                    tokenValues.set(token.mint, token.amount * tokenPrice);
-                });
-                const walletTotal = solValue + Array.from(tokenValues.values()).reduce((sum, value) => sum + value, 0);
-                grandTotalUsd += walletTotal;
-                const walletTotalElement = document.querySelector(`[data-wallet-total="${wallet.address}"]`);
-                if (walletTotalElement) walletTotalElement.textContent = formatUsd(walletTotal);
-                const solValueElement = document.querySelector(`[data-value-wallet="${wallet.address}"][data-value-mint="${SOL_MINT}"]`);
-                if (solValueElement) solValueElement.textContent = solValue > 0 ? formatUsd(solValue) : 'Price unavailable';
-                wallet.tokens.forEach(token => {
-                    const value = tokenValues.get(token.mint) || 0;
-                    const valueElement = document.querySelector(`[data-value-wallet="${wallet.address}"][data-value-mint="${token.mint}"]`);
-                    if (valueElement) valueElement.textContent = value > 0 ? formatUsd(value) : 'Price unavailable';
-                });
-            });
-            grandTotalUsdEl.textContent = grandTotalUsd.toLocaleString('en-US', {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2
-            });
+            updateGrandTotal();
         }
 
         async function fetchWithTimeout(url, options = {}) {
@@ -651,8 +628,20 @@
             let grandTotalUsd = 0;
             currentWalletData.forEach(wallet => {
                 const solPrice = currentPrices[SOL_MINT] || storedPrices[SOL_MINT]?.price || 0;
-                let walletTotal = wallet.solBalance * solPrice;
-                (wallet.tokens || []).forEach(t => {
+                let walletSol = wallet.solBalance || 0;
+                let walletTokens = wallet.tokens || [];
+
+                // Anti-fluctuation guard: if wallet is in-flight or temporarily empty, fall back to stored cache
+                if (walletTokens.length === 0 && walletSol === 0) {
+                    const fallback = storedWallets[wallet.address];
+                    if (fallback && Array.isArray(fallback.tokens) && fallback.tokens.length > 0) {
+                        walletTokens = fallback.tokens;
+                        walletSol = Number(fallback.solBalance) || 0;
+                    }
+                }
+
+                let walletTotal = walletSol * solPrice;
+                walletTokens.forEach(t => {
                     const price = currentPrices[t.mint] || storedPrices[t.mint]?.price || 0;
                     walletTotal += t.amount * price;
                 });

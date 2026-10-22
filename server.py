@@ -157,14 +157,37 @@ class TrackerHandler(BaseHTTPRequestHandler):
             return
         if path.path == "/api/tokens":
             ids = [value for value in parse_qs(path.query).get("ids", [""])[0].split(",") if value]
+            known_meta = {
+                "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp": {
+                    "name": "Apple xStock",
+                    "symbol": "AAPLx",
+                    "icon": "https://xstocks-metadata.backed.fi/logos/tokens/AAPLx.png",
+                },
+                "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh": {
+                    "name": "NVIDIA xStock",
+                    "symbol": "NVDAx",
+                    "icon": "https://xstocks-metadata.backed.fi/logos/tokens/NVDAx.png",
+                },
+                "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB": {
+                    "name": "Tesla xStock",
+                    "symbol": "TSLAx",
+                    "icon": "https://xstocks-metadata.backed.fi/logos/tokens/TSLAx.png",
+                },
+                "CARSsxWPkpQWvfyRBwfGMGvysJBHdHGfE46X5MNgmeta": {
+                    "name": "Rip Cars",
+                    "symbol": "CARS",
+                    "icon": None,
+                },
+                "8RVBk8vxLiUHueLUW1f4izFVqN3nWippLhkohKg6EGkS": {
+                    "name": "KNOTS",
+                    "symbol": "KNOTS",
+                    "icon": None,
+                },
+            }
             metadata = {}
             for mint in ids:
-                if mint == "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp":
-                    metadata[mint] = {
-                        "name": "Apple xStock",
-                        "symbol": "AAPLx",
-                        "icon": "https://xstocks-metadata.backed.fi/logos/tokens/AAPLx.png",
-                    }
+                if mint in known_meta:
+                    metadata[mint] = known_meta[mint]
                     continue
                 try:
                     request = Request(JUPITER_TOKEN_SEARCH_URL + mint, headers=DEFAULT_HEADERS)
