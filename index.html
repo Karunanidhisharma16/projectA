@@ -373,9 +373,15 @@
                 } catch (e) {
                     if (attempt === 2) {
                         console.error(`Error fetching data for ${address}:`, e);
-                        return { solBalance: 0, tokens: [], unavailable: true };
+                        const cached = storedWallets[address] || {};
+                        return {
+                            solBalance: Number(cached.solBalance) || 0,
+                            tokens: Array.isArray(cached.tokens) ? cached.tokens : [],
+                            unavailable: true,
+                            refreshedAt: cached.refreshedAt || null
+                        };
                     }
-                    await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                    await new Promise(resolve => setTimeout(resolve, 800 * (attempt + 1)));
                 }
             }
         }
@@ -692,19 +698,30 @@
                 const walletIndex = currentWalletData.findIndex(w => w.address === address);
                 if (walletIndex !== -1) {
                     const prevTokens = currentWalletData[walletIndex].tokens || [];
-                    // Anti-fluctuation guard:
-                    // If previously this wallet had tokens, and the new live query returned unavailable or an empty token list due to an RPC glitch, DO NOT wipe out the tokens!
-                    const returnedEmptyTokens = !assets.tokens || assets.tokens.length === 0;
-                    if ((assets.unavailable || (assets.partial && returnedEmptyTokens)) && prevTokens.length > 0) {
-                        console.warn(`Preserved previous balance for ${address} due to RPC partial/unavailable status.`);
-                        currentWalletData[walletIndex].unavailable = true;
-                    } else {
-                        currentWalletData[walletIndex].solBalance = Number(assets.solBalance) || 0;
-                        currentWalletData[walletIndex].tokens = Array.isArray(assets.tokens) ? assets.tokens : [];
-                        currentWalletData[walletIndex].unavailable = Boolean(assets.unavailable);
-                        currentWalletData[walletIndex].partial = Boolean(assets.partial);
-                        currentWalletData[walletIndex].refreshedAt = assets.refreshedAt || new Date().toISOString();
+                    const prevSol = currentWalletData[walletIndex].solBalance || 0;
+                    const prevRefreshedAt = currentWalletData[walletIndex].refreshedAt;
+
+                    const returnedTokens = Array.isArray(assets.tokens) ? assets.tokens : [];
+                    const returnedEmptyTokens = returnedTokens.length === 0;
+
+                    let finalSol = Number(assets.solBalance);
+                    if (!Number.isFinite(finalSol) || (assets.unavailable && prevSol > 0)) {
+                        finalSol = prevSol;
                     }
+
+                    let finalTokens = returnedTokens;
+                    // Zero-data-loss anti-fluctuation guard:
+                    // If previously this wallet had tokens, and the new live query returned unavailable or empty tokens due to partial failure, PRESERVE previous tokens!
+                    if (prevTokens.length > 0 && (assets.unavailable || (assets.partial && returnedEmptyTokens))) {
+                        console.warn(`Preserved previous balance for ${address} due to RPC partial/unavailable status.`);
+                        finalTokens = prevTokens;
+                    }
+
+                    currentWalletData[walletIndex].solBalance = finalSol;
+                    currentWalletData[walletIndex].tokens = finalTokens;
+                    currentWalletData[walletIndex].unavailable = Boolean(assets.unavailable);
+                    currentWalletData[walletIndex].partial = Boolean(assets.partial);
+                    currentWalletData[walletIndex].refreshedAt = !assets.unavailable ? (assets.refreshedAt || new Date().toISOString()) : prevRefreshedAt;
 
                     // Save latest known balance to localStorage immediately!
                     saveStoredWallets();
@@ -743,42 +760,72 @@
             const btn = document.getElementById('refreshAllBtn');
             const icon = document.getElementById('refreshAllIcon');
             const text = document.getElementById('refreshAllText');
+            const summary = document.getElementById('walletRefreshSummary');
+
             if (btn && !isBackground) {
                 btn.disabled = true;
                 if (icon) icon.innerHTML = `<span class="spinner inline-block w-3 h-3 border-2 border-t-white"></span>`;
-                if (text) text.textContent = 'Refreshing...';
+                if (text) text.textContent = 'Sorting priority...';
             }
 
-            const queue = [...currentWalletData];
+            // STRICT PRIORITY QUEUE:
+            // Wallets updated earliest (e.g. 8:00 AM before 9:00 AM before 11:00 AM)
+            // or never refreshed (null/0) ALWAYS get refreshed FIRST.
+            // NO random refreshing!
+            const priorityQueue = [...currentWalletData].sort((a, b) => {
+                const timeA = a.refreshedAt ? Date.parse(a.refreshedAt) : 0;
+                const timeB = b.refreshedAt ? Date.parse(b.refreshedAt) : 0;
+                return timeA - timeB; // Ascending: oldest first!
+            });
+
+            const total = priorityQueue.length;
             let doneCount = 0;
-            const total = currentWalletData.length;
-            const worker = async () => {
-                while (queue.length > 0) {
-                    const wallet = queue.shift();
-                    if (!isBackground && text) {
-                        text.textContent = `Refreshing (${++doneCount}/${total})...`;
-                    }
-                    await refreshSingleWallet(wallet.address);
-                    await new Promise(r => setTimeout(r, 200));
+
+            for (const wallet of priorityQueue) {
+                doneCount++;
+                const timeLabel = wallet.refreshedAt ? formatPriceTime(wallet.refreshedAt) : 'Never';
+                if (!isBackground && text) {
+                    text.textContent = `(${doneCount}/${total}) ${wallet.name.slice(0, 10)}...`;
                 }
-            };
-            await Promise.all([worker(), worker()]);
+                if (summary) {
+                    summary.innerHTML = `<span class="text-emerald-400 font-semibold">Priority Refreshing (${doneCount}/${total}):</span> <span class="text-white">${wallet.name}</span> <span class="text-xs text-slate-400">(Prior update: ${timeLabel})</span>`;
+                }
+
+                // Add active highlight ring to current wallet card
+                const cardEl = document.getElementById(`wallet-card-${wallet.address}`);
+                if (cardEl) {
+                    cardEl.classList.add('ring-2', 'ring-emerald-400', 'border-emerald-500');
+                }
+
+                try {
+                    await refreshSingleWallet(wallet.address);
+                } catch (e) {
+                    console.error(`Priority refresh error for ${wallet.name}:`, e);
+                } finally {
+                    const updatedCard = document.getElementById(`wallet-card-${wallet.address}`);
+                    if (updatedCard) {
+                        updatedCard.classList.remove('ring-2', 'ring-emerald-400', 'border-emerald-500');
+                    }
+                }
+
+                // Paced interval between wallets to prevent rate limit spikes
+                await new Promise(r => setTimeout(r, 250));
+            }
 
             // Save all wallets to localStorage
             saveStoredWallets();
 
-            const summary = document.getElementById('walletRefreshSummary');
             if (summary) {
-                summary.textContent = `All wallets live updated: ${formatPriceTime(new Date())}`;
+                summary.textContent = `All ${total} wallets refreshed in priority order: ${formatPriceTime(new Date())}`;
             }
             if (btn && !isBackground) {
                 btn.disabled = false;
                 if (icon) icon.textContent = '✓';
-                if (text) text.textContent = 'Updated!';
+                if (text) text.textContent = 'All Updated!';
                 setTimeout(() => {
                     if (icon) icon.textContent = '↻';
                     if (text) text.textContent = 'Refresh All Wallets';
-                }, 2500);
+                }, 3000);
             }
             isRefreshingAll = false;
         }

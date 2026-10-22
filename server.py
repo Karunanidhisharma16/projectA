@@ -10,10 +10,29 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parent
-SOLANA_RPC_URLS = (
-    "https://api.mainnet-beta.solana.com",
-    "https://api.mainnet.solana.com",
-)
+RPC_PROVIDERS = [
+    {
+        "url": "https://api.mainnet-beta.solana.com",
+        "methods": {"getBalance", "getTokenAccountsByOwner", "getMultipleAccounts", "getHealth"},
+        "min_interval": 0.12,
+        "last_call": 0.0,
+        "cooldown_until": 0.0,
+    },
+    {
+        "url": "https://nodes.mewapi.io/rpc/sol",
+        "methods": {"getBalance", "getTokenAccountsByOwner", "getMultipleAccounts", "getHealth"},
+        "min_interval": 0.12,
+        "last_call": 0.0,
+        "cooldown_until": 0.0,
+    },
+    {
+        "url": "https://solana-rpc.publicnode.com",
+        "methods": {"getBalance", "getHealth"},
+        "min_interval": 0.10,
+        "last_call": 0.0,
+        "cooldown_until": 0.0,
+    },
+]
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 JUPITER_TOKEN_SEARCH_URL = "https://api.jup.ag/tokens/v2/search?query="
@@ -25,15 +44,13 @@ DEFAULT_HEADERS = {
 RPC_CACHE = {}
 RPC_CACHE_LOCK = threading.Lock()
 RPC_RATE_LIMIT_LOCK = threading.Lock()
-LAST_RPC_CALL_TIME = 0.0
-MIN_RPC_INTERVAL = 0.12  # Minimum 120ms between outbound RPC requests
 RPC_PROVIDER_INDEX = 0
 RPC_CACHE_TTL_SECONDS = 30
 WALLET_CACHE_TTL_SECONDS = 60
 PRICE_CACHE_TTL_SECONDS = 900
 PRICE_CACHE_FILE = ROOT / "price_cache.json"
 WALLET_CACHE_FILE = ROOT / "wallet_cache.json"
-RPC_TIMEOUT_SECONDS = 12
+RPC_TIMEOUT_SECONDS = 4
 WALLET_ADDRESS_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 WALLET_CACHE = {}
 WALLET_SNAPSHOT_CACHE = {}
@@ -212,33 +229,55 @@ class TrackerHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._send(500, "application/json", json.dumps({"error": str(error)}).encode())
 
-    def _rate_limit_wait(self):
-        global LAST_RPC_CALL_TIME
-        with RPC_RATE_LIMIT_LOCK:
-            now = time.monotonic()
-            elapsed = now - LAST_RPC_CALL_TIME
-            if elapsed < MIN_RPC_INTERVAL:
-                time.sleep(MIN_RPC_INTERVAL - elapsed)
-            LAST_RPC_CALL_TIME = time.monotonic()
-
     def _forward_rpc(self, body):
-        cache_key = body.decode("utf-8")
+        cache_key = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
         with RPC_CACHE_LOCK:
             cached = RPC_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < RPC_CACHE_TTL_SECONDS:
             return cached[1]
 
+        # Extract method from JSON body to filter capable providers
+        method = ""
+        try:
+            req_json = json.loads(body)
+            if isinstance(req_json, dict):
+                method = req_json.get("method", "")
+        except Exception:
+            pass
+
+        now = time.monotonic()
+        # Filter providers supporting this method
+        eligible = [
+            p for p in RPC_PROVIDERS
+            if not method or method in p["methods"]
+        ]
+        if not eligible:
+            eligible = RPC_PROVIDERS
+
         global RPC_PROVIDER_INDEX
         with RPC_CACHE_LOCK:
-            start_index = RPC_PROVIDER_INDEX
-            RPC_PROVIDER_INDEX = (RPC_PROVIDER_INDEX + 1) % len(SOLANA_RPC_URLS)
-        ordered_urls = SOLANA_RPC_URLS[start_index:] + SOLANA_RPC_URLS[:start_index]
-        for retry_round in range(3):
-            for rpc_url in ordered_urls:
-                self._rate_limit_wait()
+            RPC_PROVIDER_INDEX = (RPC_PROVIDER_INDEX + 1) % len(RPC_PROVIDERS)
+            offset = RPC_PROVIDER_INDEX
+
+        rotated = eligible[offset % len(eligible):] + eligible[:offset % len(eligible)]
+        # Put providers not currently in cooldown first
+        active_providers = [p for p in rotated if p["cooldown_until"] <= now]
+        cooldown_providers = [p for p in rotated if p["cooldown_until"] > now]
+        candidate_providers = active_providers + cooldown_providers
+
+        for retry_round in range(2):
+            for provider in candidate_providers:
+                # Per-provider rate-limiting
+                with RPC_RATE_LIMIT_LOCK:
+                    p_now = time.monotonic()
+                    elapsed = p_now - provider["last_call"]
+                    if elapsed < provider["min_interval"]:
+                        time.sleep(provider["min_interval"] - elapsed)
+                    provider["last_call"] = time.monotonic()
+
                 request = Request(
-                    rpc_url,
-                    data=body,
+                    provider["url"],
+                    data=body if isinstance(body, bytes) else body.encode("utf-8"),
                     headers=DEFAULT_HEADERS,
                     method="POST",
                 )
@@ -247,17 +286,24 @@ class TrackerHandler(BaseHTTPRequestHandler):
                         result = response.read()
                         parsed = json.loads(result)
                         if isinstance(parsed, dict) and parsed.get("error"):
+                            err_code = parsed.get("error", {}).get("code")
+                            if err_code in (-32005, 429):
+                                provider["cooldown_until"] = time.monotonic() + 10.0
                             continue
                         with RPC_CACHE_LOCK:
                             RPC_CACHE[cache_key] = (time.monotonic(), result)
                         return result
                 except HTTPError as error:
-                    if error.code == 429:
-                        time.sleep(1.0 * (retry_round + 1))
+                    if error.code in (429, 403, 502, 503, 504):
+                        provider["cooldown_until"] = time.monotonic() + 15.0
                     continue
                 except (OSError, TimeoutError, json.JSONDecodeError):
+                    provider["cooldown_until"] = time.monotonic() + 5.0
                     continue
-            time.sleep(0.5 * (retry_round + 1))
+
+            if retry_round == 0:
+                time.sleep(0.4)
+
         return None
 
     def _get_wallet(self, address, force=False):
@@ -310,62 +356,101 @@ class TrackerHandler(BaseHTTPRequestHandler):
             result = self._forward_rpc(json.dumps(request_body).encode())
             if result is not None:
                 try:
-                    responses[request_body["id"]] = json.loads(result)
+                    parsed = json.loads(result)
+                    if isinstance(parsed, dict) and "result" in parsed:
+                        responses[request_body["id"]] = parsed
                 except json.JSONDecodeError:
                     pass
 
-        sol_balance = 0.0
+        # Load previous verified data to guard against data loss
+        with RPC_CACHE_LOCK:
+            previous = WALLET_SNAPSHOT_CACHE.get(address)
+            if previous is None:
+                try:
+                    disk_cache = json.loads(WALLET_CACHE_FILE.read_text(encoding="utf-8"))
+                    if isinstance(disk_cache, dict) and address in disk_cache:
+                        previous = disk_cache[address]
+                        WALLET_SNAPSHOT_CACHE[address] = previous
+                except Exception:
+                    pass
+
+        # 1. SOL balance
         balance_response = responses.get(1)
         if balance_response and isinstance(balance_response.get("result"), dict):
             sol_balance = balance_response["result"].get("value", 0) / 1_000_000_000
+        elif previous and "solBalance" in previous:
+            sol_balance = previous["solBalance"]
+        else:
+            sol_balance = 0.0
 
+        # 2. Token balances
+        got_tokenkeg = 2 in responses
+        got_token2022 = 3 in responses
         token_amounts = {}
-        for response_id in (2, 3):
-            response = responses.get(response_id)
-            value = response.get("result", {}).get("value", []) if response else []
-            for account in value:
-                try:
-                    info = account["account"]["data"]["parsed"]["info"]
-                    token_amount = info["tokenAmount"]
-                    raw_amount = int(token_amount["amount"])
-                    if raw_amount > 0:
-                        mint = info["mint"]
-                        amount = float(token_amount["uiAmountString"])
-                        token_amounts[mint] = token_amounts.get(mint, 0) + amount
-                except (KeyError, TypeError, ValueError):
-                    continue
+
+        if got_tokenkeg or got_token2022:
+            for response_id in (2, 3):
+                response = responses.get(response_id)
+                value = response.get("result", {}).get("value", []) if response else []
+                for account in value:
+                    try:
+                        info = account["account"]["data"]["parsed"]["info"]
+                        token_amount = info["tokenAmount"]
+                        raw_amount = int(token_amount["amount"])
+                        if raw_amount > 0:
+                            mint = info["mint"]
+                            amount = float(token_amount["uiAmountString"])
+                            token_amounts[mint] = token_amounts.get(mint, 0) + amount
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+        # Zero-data-loss guard:
+        # If new on-chain query returned tokens, use them!
+        # If new on-chain query returned 0 tokens BUT previous snapshot had tokens:
+        # Only wipe if BOTH token accounts were cleanly retrieved without error AND sol balance was retrieved.
+        # Otherwise, keep previous tokens so balances are NEVER corrupted by transient network/RPC glitches.
+        if token_amounts:
+            final_tokens = [
+                {"mint": mint, "amount": amount}
+                for mint, amount in sorted(token_amounts.items())
+            ]
+        elif previous and previous.get("tokens"):
+            if got_tokenkeg and got_token2022 and (1 in responses):
+                final_tokens = []
+            else:
+                final_tokens = previous.get("tokens", [])
+        else:
+            final_tokens = []
+
+        is_unavailable = len(responses) == 0
+        is_partial = len(responses) < 3
 
         wallet = {
             "solBalance": sol_balance,
-            "tokens": [
-                {"mint": mint, "amount": amount}
-                for mint, amount in token_amounts.items()
-            ],
-            "unavailable": not responses,
-            "partial": len(responses) < 3,
+            "tokens": final_tokens,
+            "unavailable": is_unavailable,
+            "partial": is_partial,
         }
+
         with RPC_CACHE_LOCK:
-            previous = WALLET_SNAPSHOT_CACHE.get(address)
-            if not wallet["unavailable"]:
-                if not wallet["partial"] or previous is None:
-                    wallet["refreshedAt"] = time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                    )
-                    WALLET_SNAPSHOT_CACHE[address] = wallet
-                    try:
-                        WALLET_CACHE_FILE.write_text(
-                            json.dumps(WALLET_SNAPSHOT_CACHE, indent=2),
-                            encoding="utf-8",
-                        )
-                    except OSError:
-                        pass
-                elif previous and wallet["partial"]:
-                    if 1 in responses:
-                        previous["solBalance"] = sol_balance
-                    wallet = previous
+            # Only update refreshedAt timestamp and disk snapshot on genuine success
+            if not is_unavailable and not (is_partial and len(final_tokens) == 0 and previous and len(previous.get("tokens", [])) > 0):
+                wallet["refreshedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                WALLET_SNAPSHOT_CACHE[address] = wallet
+                try:
+                    temp_file = WALLET_CACHE_FILE.with_suffix(".tmp")
+                    temp_file.write_text(json.dumps(WALLET_SNAPSHOT_CACHE, indent=2), encoding="utf-8")
+                    temp_file.replace(WALLET_CACHE_FILE)
+                except OSError:
+                    pass
             elif previous:
-                wallet = previous
+                wallet["refreshedAt"] = previous.get("refreshedAt")
+                wallet["solBalance"] = previous.get("solBalance", sol_balance)
+                wallet["tokens"] = previous.get("tokens", final_tokens)
+                WALLET_SNAPSHOT_CACHE[address] = wallet
+
             WALLET_CACHE[address] = (time.monotonic(), wallet)
+
         return wallet
 
 
