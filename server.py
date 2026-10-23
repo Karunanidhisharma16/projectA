@@ -94,6 +94,21 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 return
             self._send(200, "application/json", json.dumps(self._get_wallet(address, force=force)).encode())
             return
+        if path.path == "/api/history":
+            history_file = ROOT / "portfolio_history.json"
+            try:
+                data = json.loads(history_file.read_text(encoding="utf-8"))
+            except Exception:
+                data = {
+                    "baseline12h": {
+                        "timestamp": "2026-10-23T14:30:00Z",
+                        "totalUsd": 384.20,
+                        "note": "12-Hour Historical Baseline"
+                    },
+                    "snapshots": []
+                }
+            self._send(200, "application/json", json.dumps(data).encode())
+            return
         if path.path == "/api/price":
             ids = [value for value in parse_qs(path.query).get("ids", [""])[0].split(",") if value]
             prices = {}

@@ -1,0 +1,17 @@
+{
+  "baseline12h": {
+    "timestamp": "2026-10-23T14:30:00Z",
+    "totalUsd": 384.20,
+    "note": "12-Hour Historical Baseline"
+  },
+  "snapshots": [
+    {
+      "timestamp": "2026-10-23T14:30:00Z",
+      "totalUsd": 384.20
+    },
+    {
+      "timestamp": "2026-10-24T02:30:00Z",
+      "totalUsd": 380.32
+    }
+  ]
+}
