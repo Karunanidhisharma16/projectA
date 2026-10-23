@@ -32,6 +32,13 @@ RPC_PROVIDERS = [
         "last_call": 0.0,
         "cooldown_until": 0.0,
     },
+    {
+        "url": "https://rpc.ankr.com/solana",
+        "methods": {"getBalance", "getTokenAccountsByOwner", "getMultipleAccounts", "getHealth"},
+        "min_interval": 0.12,
+        "last_call": 0.0,
+        "cooldown_until": 0.0,
+    },
 ]
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v3"
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
@@ -93,6 +100,9 @@ class TrackerHandler(BaseHTTPRequestHandler):
                 self._send(400, "application/json", b'{"error":"Invalid wallet address"}')
                 return
             self._send(200, "application/json", json.dumps(self._get_wallet(address, force=force)).encode())
+            return
+        if path.path == "/api/refresh-all":
+            self._send(200, "application/json", json.dumps(self._refresh_all_wallets()).encode())
             return
         if path.path == "/api/history":
             history_file = ROOT / "portfolio_history.json"
@@ -197,6 +207,11 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     "name": "KNOTS",
                     "symbol": "KNOTS",
                     "icon": None,
+                },
+                "HXQ66zSRqynwJQ6vYEYa85qGY9C2Ycz8rnYQHgApn391": {
+                    "name": "STOKN",
+                    "symbol": "GO",
+                    "icon": "https://cdn.dexscreener.com/cms/images/BmYAuns9jUCTUwly?width=800&height=800&quality=95&format=auto",
                 },
             }
             metadata = {}
@@ -344,6 +359,24 @@ class TrackerHandler(BaseHTTPRequestHandler):
 
         return None
 
+    def _refresh_all_wallets(self):
+        try:
+            accounts_file = ROOT / "account.json"
+            accounts = json.loads(accounts_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {"error": "Failed to load account.json"}
+
+        addresses = [acc["address"] for acc in accounts if isinstance(acc, dict) and "address" in acc]
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            list(executor.map(lambda addr: self._refresh_wallet(addr), addresses))
+
+        with RPC_CACHE_LOCK:
+            return {
+                "success": True,
+                "count": len(addresses),
+                "wallets": WALLET_SNAPSHOT_CACHE
+            }
+
     def _get_wallet(self, address, force=False):
         if force:
             return self._refresh_wallet(address)
@@ -442,21 +475,17 @@ class TrackerHandler(BaseHTTPRequestHandler):
                     except (KeyError, TypeError, ValueError):
                         continue
 
-        # Zero-data-loss guard:
-        # If new on-chain query returned tokens, use them!
-        # If new on-chain query returned 0 tokens BUT previous snapshot had tokens:
-        # Only wipe if BOTH token accounts were cleanly retrieved without error AND sol balance was retrieved.
-        # Otherwise, keep previous tokens so balances are NEVER corrupted by transient network/RPC glitches.
-        if token_amounts:
+        # Ground truth on-chain accounting:
+        # If we successfully queried token programs, store exact live on-chain balances.
+        # Sold tokens (balance 0) are removed, and newly acquired tokens are added.
+        if got_tokenkeg or got_token2022:
             final_tokens = [
                 {"mint": mint, "amount": amount}
                 for mint, amount in sorted(token_amounts.items())
             ]
         elif previous and previous.get("tokens"):
-            if got_tokenkeg and got_token2022 and (1 in responses):
-                final_tokens = []
-            else:
-                final_tokens = previous.get("tokens", [])
+            # Only fall back to previous cached data if both token RPC queries failed due to network glitches
+            final_tokens = previous.get("tokens", [])
         else:
             final_tokens = []
 

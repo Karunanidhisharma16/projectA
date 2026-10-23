@@ -180,8 +180,22 @@
             { name: 'akhilpagalhai1@gmail.com', address: '5uyqJdaExRFyz7DPj37RicfEFA1zvLGCCvQjx7ReJ8Rm' }
         ];
 
+        const KNOWN_TOKENS = {
+            'XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB': { name: 'Tesla xStock', symbol: 'TSLAx' },
+            'Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh': { name: 'NVIDIA xStock', symbol: 'NVDAx' },
+            'XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp': { name: 'Apple xStock', symbol: 'AAPLx' },
+            'HXQ66zSRqynwJQ6vYEYa85qGY9C2Ycz8rnYQHgApn391': { name: 'STOKN', symbol: 'GO' },
+            'CARSsxWPkpQWvfyRBwfGMGvysJBHdHGfE46X5MNgmeta': { name: 'Rip Cars', symbol: 'CARS' },
+            '8RVBk8vxLiUHueLUW1f4izFVqN3nWippLhkohKg6EGkS': { name: 'KNOTS', symbol: 'KNOTS' },
+            'So11111111111111111111111111111111111111112': { name: 'Wrapped SOL', symbol: 'SOL' }
+        };
+
         let tokenMap = new Map(); // Maps mint address to symbol
         let tokenMetadata = new Map();
+        for (const [mint, info] of Object.entries(KNOWN_TOKENS)) {
+            tokenMap.set(mint, info.symbol);
+            tokenMetadata.set(mint, info);
+        }
         const walletAssetsCache = new Map();
         const PRICE_STORAGE_KEY = 'solana-portfolio-prices-v1';
         const WALLET_STORAGE_KEY = 'solana-portfolio-wallets-v1';
@@ -522,43 +536,26 @@
                 console.warn('Could not load wallet_cache.json', e);
             }
 
-            // 2. Build initial wallet data with non-decreasing token merging
+            // 2. Build initial wallet data using verified server snapshot
             let allMintsToPrice = new Set([SOL_MINT]);
             currentWalletData = accounts.map(acc => {
-                const local = storedWallets[acc.address];
                 const server = serverSavedWallets[acc.address];
-                
-                // Bulletproof token merging: Never lose any token!
-                const tokenMap = new Map();
-                if (server && Array.isArray(server.tokens)) {
-                    server.tokens.forEach(t => {
-                        if (t && t.mint) {
-                            tokenMap.set(t.mint, Math.max(tokenMap.get(t.mint) || 0, Number(t.amount) || 0));
-                        }
-                    });
-                }
-                if (local && Array.isArray(local.tokens)) {
-                    local.tokens.forEach(t => {
-                        if (t && t.mint) {
-                            tokenMap.set(t.mint, Math.max(tokenMap.get(t.mint) || 0, Number(t.amount) || 0));
-                        }
-                    });
-                }
+                const local = storedWallets[acc.address];
+                const source = (server && (server.tokens?.length > 0 || server.solBalance > 0 || server.refreshedAt))
+                    ? server
+                    : (local || {});
 
-                const tokens = Array.from(tokenMap.entries()).map(([mint, amount]) => ({ mint, amount }));
+                const tokens = Array.isArray(source.tokens) ? source.tokens : [];
                 tokens.forEach(t => allMintsToPrice.add(t.mint));
 
-                const solBalance = Math.max(Number(local?.solBalance) || 0, Number(server?.solBalance) || 0);
-                const refreshedAt = local?.refreshedAt || server?.refreshedAt || null;
-
                 return {
-                    name: acc.name || local?.name || server?.name || 'Unnamed',
+                    name: acc.name || source.name || 'Unnamed',
                     address: acc.address,
-                    solBalance: solBalance,
+                    solBalance: Number(source.solBalance) || 0,
                     tokens: tokens,
                     unavailable: false,
                     partial: false,
-                    refreshedAt: refreshedAt
+                    refreshedAt: source.refreshedAt || null
                 };
             });
 
@@ -581,7 +578,7 @@
                 fetchPrices(allMintsToPrice).then(livePrices => {
                     Object.assign(currentPrices, livePrices);
                     renderTokenPriceControls(allMintsToPrice, currentPrices);
-                    updateGrandTotal();
+                    renderDashboard();
                 });
             });
 
@@ -807,8 +804,9 @@
 
             const orderedMints = [
                 'XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB',
-                'Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh',
                 'XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp',
+                'Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh',
+                'HXQ66zSRqynwJQ6vYEYa85qGY9C2Ycz8rnYQHgApn391',
                 'CARSsxWPkpQWvfyRBwfGMGvysJBHdHGfE46X5MNgmeta',
                 '8RVBk8vxLiUHueLUW1f4izFVqN3nWippLhkohKg6EGkS',
                 SOL_MINT
@@ -898,44 +896,17 @@
                 const assets = await fetchWalletAssets(address, true);
                 const walletIndex = currentWalletData.findIndex(w => w.address === address);
                 if (walletIndex !== -1) {
-                    const prevTokens = currentWalletData[walletIndex].tokens || [];
-                    const prevSol = currentWalletData[walletIndex].solBalance || 0;
                     const prevRefreshedAt = currentWalletData[walletIndex].refreshedAt;
 
-                    const returnedTokens = Array.isArray(assets.tokens) ? assets.tokens : [];
-                    const returnedEmptyTokens = returnedTokens.length === 0;
-
-                    let finalSol = Number(assets.solBalance);
-                    if (!Number.isFinite(finalSol) || (assets.unavailable && prevSol > 0)) {
-                        finalSol = prevSol;
+                    if (!assets.unavailable) {
+                        currentWalletData[walletIndex].solBalance = Number(assets.solBalance) || 0;
+                        currentWalletData[walletIndex].tokens = Array.isArray(assets.tokens) ? assets.tokens : [];
+                        currentWalletData[walletIndex].refreshedAt = assets.refreshedAt || new Date().toISOString();
+                        currentWalletData[walletIndex].unavailable = false;
+                        currentWalletData[walletIndex].partial = Boolean(assets.partial);
+                    } else {
+                        console.warn(`Preserved previous balance for ${address} due to RPC unavailable.`);
                     }
-
-                    let finalTokens = returnedTokens;
-                    // Bulletproof non-decreasing token guard:
-                    // If previously this wallet had tokens, never let an RPC glitch or partial drop wipe out verified holdings!
-                    if (prevTokens.length > 0) {
-                        if (assets.unavailable || (assets.partial && returnedEmptyTokens)) {
-                            console.warn(`Preserved previous balance for ${address} due to RPC partial/unavailable status.`);
-                            finalTokens = prevTokens;
-                        } else if (returnedTokens.length > 0) {
-                            const map = new Map();
-                            prevTokens.forEach(t => map.set(t.mint, t.amount));
-                            returnedTokens.forEach(t => {
-                                if (t && t.mint) {
-                                    if (!assets.partial || t.amount >= (map.get(t.mint) || 0)) {
-                                        map.set(t.mint, t.amount);
-                                    }
-                                }
-                            });
-                            finalTokens = Array.from(map.entries()).map(([mint, amount]) => ({ mint, amount }));
-                        }
-                    }
-
-                    currentWalletData[walletIndex].solBalance = finalSol;
-                    currentWalletData[walletIndex].tokens = finalTokens;
-                    currentWalletData[walletIndex].unavailable = Boolean(assets.unavailable);
-                    currentWalletData[walletIndex].partial = Boolean(assets.partial);
-                    currentWalletData[walletIndex].refreshedAt = !assets.unavailable ? (assets.refreshedAt || new Date().toISOString()) : prevRefreshedAt;
 
                     // Save latest known balance to localStorage immediately!
                     saveStoredWallets();
@@ -979,17 +950,54 @@
             if (btn && !isBackground) {
                 btn.disabled = true;
                 if (icon) icon.innerHTML = `<span class="spinner inline-block w-3 h-3 border-2 border-t-white"></span>`;
-                if (text) text.textContent = 'Sorting priority...';
+                if (text) text.textContent = 'Syncing...';
+            }
+            if (summary) {
+                summary.innerHTML = `<span class="text-emerald-400 font-semibold animate-pulse">Syncing all 19 wallets live with Solana...</span>`;
             }
 
-            // STRICT PRIORITY QUEUE:
-            // Wallets updated earliest (e.g. 8:00 AM before 9:00 AM before 11:00 AM)
-            // or never refreshed (null/0) ALWAYS get refreshed FIRST.
-            // NO random refreshing!
+            try {
+                // Fast server-side parallel sync across all RPC providers
+                const res = await fetchWithTimeout('/api/refresh-all');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.wallets) {
+                        for (let i = 0; i < currentWalletData.length; i++) {
+                            const addr = currentWalletData[i].address;
+                            if (data.wallets[addr]) {
+                                currentWalletData[i].solBalance = Number(data.wallets[addr].solBalance) || 0;
+                                currentWalletData[i].tokens = data.wallets[addr].tokens || [];
+                                currentWalletData[i].refreshedAt = data.wallets[addr].refreshedAt;
+                                currentWalletData[i].unavailable = false;
+                            }
+                        }
+                        saveStoredWallets();
+                        renderDashboard();
+                        if (summary) {
+                            summary.textContent = `All 19 wallets live synced: ${formatPriceTime(new Date())}`;
+                        }
+                        if (btn && !isBackground) {
+                            btn.disabled = false;
+                            if (icon) icon.textContent = '✓';
+                            if (text) text.textContent = 'All Live!';
+                            setTimeout(() => {
+                                if (icon) icon.textContent = '↻';
+                                if (text) text.textContent = 'Refresh All Wallets';
+                            }, 3000);
+                        }
+                        isRefreshingAll = false;
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.warn('Fast server refresh had error; running client refresh', e);
+            }
+
+            // Client-side fallback if server endpoint unavailable
             const priorityQueue = [...currentWalletData].sort((a, b) => {
                 const timeA = a.refreshedAt ? Date.parse(a.refreshedAt) : 0;
                 const timeB = b.refreshedAt ? Date.parse(b.refreshedAt) : 0;
-                return timeA - timeB; // Ascending: oldest first!
+                return timeA - timeB;
             });
 
             const total = priorityQueue.length;
@@ -997,40 +1005,21 @@
 
             for (const wallet of priorityQueue) {
                 doneCount++;
-                const timeLabel = wallet.refreshedAt ? formatPriceTime(wallet.refreshedAt) : 'Never';
                 if (!isBackground && text) {
                     text.textContent = `(${doneCount}/${total}) ${wallet.name.slice(0, 10)}...`;
                 }
-                if (summary) {
-                    summary.innerHTML = `<span class="text-emerald-400 font-semibold">Priority Refreshing (${doneCount}/${total}):</span> <span class="text-white">${wallet.name}</span> <span class="text-xs text-slate-400">(Prior update: ${timeLabel})</span>`;
-                }
-
-                // Add active highlight ring to current wallet card
-                const cardEl = document.getElementById(`wallet-card-${wallet.address}`);
-                if (cardEl) {
-                    cardEl.classList.add('ring-2', 'ring-emerald-400', 'border-emerald-500');
-                }
-
                 try {
                     await refreshSingleWallet(wallet.address);
                 } catch (e) {
                     console.error(`Priority refresh error for ${wallet.name}:`, e);
-                } finally {
-                    const updatedCard = document.getElementById(`wallet-card-${wallet.address}`);
-                    if (updatedCard) {
-                        updatedCard.classList.remove('ring-2', 'ring-emerald-400', 'border-emerald-500');
-                    }
                 }
-
-                // Paced interval between wallets to prevent rate limit spikes
-                await new Promise(r => setTimeout(r, 250));
+                await new Promise(r => setTimeout(r, 100));
             }
 
-            // Save all wallets to localStorage
             saveStoredWallets();
 
             if (summary) {
-                summary.textContent = `All ${total} wallets refreshed in priority order: ${formatPriceTime(new Date())}`;
+                summary.textContent = `All ${total} wallets refreshed: ${formatPriceTime(new Date())}`;
             }
             if (btn && !isBackground) {
                 btn.disabled = false;
